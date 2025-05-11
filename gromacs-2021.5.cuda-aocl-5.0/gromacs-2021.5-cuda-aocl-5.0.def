@@ -1,0 +1,255 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+%files
+    # Copy the manually downloaded AOCL deb file
+    aocl-linux-aocc-5.0.0_1_amd64.deb /opt/amd/aocl-linux-aocc-5.0.0_1_amd64.deb
+
+%post
+    # Set non-interactive
+    export DEBIAN_FRONTEND=noninteractive
+    
+    # Update and install dependencies
+    apt-get update && apt-get install -y \
+        wget \
+        git \
+        cmake \
+        build-essential \
+        libhwloc-dev \
+        libopenmpi-dev \
+        openmpi-bin \
+        python3 \
+        python3-pip \
+        curl \
+        ca-certificates \
+        pkg-config \
+        libnuma-dev \
+        libtool \
+        autotools-dev \
+        automake \
+        software-properties-common \
+        gcc-11 \
+        g++-11 \
+        gfortran-11 \
+        patchelf \
+        binutils \
+        tree \
+        chrpath \
+        sed \
+        libgfortran5 \
+        libgomp1
+    
+    # Create working directories
+    mkdir -p /opt/amd /opt/gromacs /opt/cuda
+    
+    # Install AMD AOCL 5.0
+    cd /opt/amd
+    if [ -f "aocl-linux-aocc-5.0.0_1_amd64.deb" ]; then
+        echo "Installing AOCL 5.0..."
+        dpkg -i aocl-linux-aocc-5.0.0_1_amd64.deb || true
+        apt-get install -f -y
+    else
+        echo "ERROR: AOCL deb file not found!"
+        exit 1
+    fi
+    
+    # Find actual AOCL installation
+    AOCL_ROOT="/opt/AMD/aocl/aocl-linux-aocc-5.0.0"
+    
+    # Install system FFTW libraries
+    apt-get install -y libfftw3-dev
+    
+    # Install system BLAS and LAPACK libraries
+    apt-get install -y libopenblas-dev liblapack-dev
+    
+    # Create directory structure for our modified libraries
+    mkdir -p /opt/amd/aocl-systemlibs/lib
+    mkdir -p /opt/amd/aocl-systemlibs/lib_LP64
+    mkdir -p /opt/amd/aocl-systemlibs/include
+    
+    # Copy include files
+    if [ -d "$AOCL_ROOT/aocc/include_LP64" ]; then
+        cp -r "$AOCL_ROOT/aocc/include_LP64"/* /opt/amd/aocl-systemlibs/include/
+    fi
+    
+    # Function to patch libraries - Replace OpenMP with system gomp
+    copy_and_patch_lib() {
+        local src_file="$1"
+        local dst_file="$2"
+        
+        echo "Processing $src_file..."
+        
+        # Copy the file
+        cp -L "$src_file" "$dst_file"
+        
+        # Replace AMD OpenMP with system gomp
+        patchelf --replace-needed libomp.so "libgomp.so.1" "$dst_file" 2>/dev/null || true
+        patchelf --replace-needed libomp.so.5 "libgomp.so.1" "$dst_file" 2>/dev/null || true
+        
+        # Add proper rpath
+        patchelf --force-rpath --set-rpath '/opt/amd/aocl-systemlibs/lib:/opt/amd/aocl-systemlibs/lib_LP64:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu' "$dst_file" 2>/dev/null || true
+        
+        echo "  Patched: $dst_file"
+    }
+    
+    # Skip problematic AOCL copy operations
+    echo "Skipping AOCL library processing - using system libraries instead"
+    
+    # Skip AMD FFTW libraries, we'll use system libraries instead
+    echo "Using system FFTW libraries instead of AOCL versions"
+    
+    # Install CUDA 11.6.2
+    cd /opt/cuda
+    wget https://developer.download.nvidia.com/compute/cuda/11.6.2/local_installers/cuda_11.6.2_510.47.03_linux.run
+    sh cuda_11.6.2_510.47.03_linux.run --silent --toolkit --no-opengl-libs
+    
+    # Set environment
+    export PATH=/usr/local/cuda-11.6/bin:$PATH
+    export LD_LIBRARY_PATH=/usr/local/cuda-11.6/lib64:$LD_LIBRARY_PATH
+    
+    # Download GROMACS 2021.5
+    cd /opt/gromacs
+    wget https://ftp.gromacs.org/gromacs/gromacs-2021.5.tar.gz
+    tar -xzvf gromacs-2021.5.tar.gz
+    cd gromacs-2021.5
+    
+    # Create build directory
+    mkdir build
+    cd build
+    
+    # Use gcc-11
+    export CC=gcc-11
+    export CXX=g++-11
+    export FC=gfortran-11
+    
+    # Set compiler flags
+    export CFLAGS="-march=znver3 -O3 -funroll-loops -ffast-math"
+    export CXXFLAGS="-march=znver3 -O3 -funroll-loops -ffast-math"
+    export FFLAGS="-march=znver3 -O3"
+    
+    # Set up library paths - use system libraries
+    FFTW_LIB="/usr/lib/x86_64-linux-gnu/libfftw3.so"
+    FFTWF_LIB="/usr/lib/x86_64-linux-gnu/libfftw3f.so"
+    BLIS_LIB="/usr/lib/x86_64-linux-gnu/libopenblas.so"
+    FLAME_LIB="/usr/lib/x86_64-linux-gnu/liblapack.so"
+    FFTW_INC="/usr/include"
+    
+    # Set environment for build
+    export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+    export LDFLAGS="-L/usr/lib/x86_64-linux-gnu -lfftw3 -lfftw3f -lopenblas -llapack"
+    
+    # Configure with system libraries
+    cmake .. \
+        -DCMAKE_INSTALL_PREFIX=/opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DGMX_BUILD_OWN_FFTW=OFF \
+        -DGMX_FFT_LIBRARY=fftw3 \
+        -DGMX_GPU=CUDA \
+        -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-11.6 \
+        -DGMX_CUDA_TARGET_SM="80" \
+        -DGMX_MPI=ON \
+        -DCMAKE_C_COMPILER=gcc-11 \
+        -DCMAKE_CXX_COMPILER=g++-11 \
+        -DCMAKE_Fortran_COMPILER=gfortran-11 \
+        -DFFTWF_LIBRARY="$FFTWF_LIB" \
+        -DFFTWF_INCLUDE_DIR="$FFTW_INC" \
+        -DFFTW_LIBRARY="$FFTW_LIB" \
+        -DFFTW_INCLUDE_DIR="$FFTW_INC" \
+        -DGMX_BLAS_USER="$BLIS_LIB" \
+        -DGMX_LAPACK_USER="$FLAME_LIB" \
+        -DGMX_SIMD=AVX_512 \
+        -DGMX_HWLOC=ON \
+        -DGMX_CYCLE_SUBCOUNTERS=ON \
+        -DGMX_OPENMP=ON \
+        -DCMAKE_CUDA_HOST_COMPILER=gcc-11 \
+        -DGMX_CUDA_NVCC_FLAGS="-allow-unsupported-compiler" \
+        -DOpenMP_CXX_FLAGS="-fopenmp" \
+        -DOpenMP_CXX_LIB_NAMES="gomp" \
+        -DOpenMP_gomp_LIBRARY="/usr/lib/x86_64-linux-gnu/libgomp.so.1" \
+        -DOpenMP_C_FLAGS="-fopenmp" \
+        -DOpenMP_C_LIB_NAMES="gomp" \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath=/usr/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lfftw3 -lfftw3f -lopenblas -llapack -lgfortran" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath=/usr/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lfftw3 -lfftw3f -lopenblas -llapack -lgfortran"
+    
+    # Build GROMACS
+    make -j$(nproc)
+    
+    # Install GROMACS
+    make install
+    
+    # Create wrapper script
+    cat > /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_wrapper.sh << 'EOF'
+#!/bin/bash
+# Ensure our custom libraries are found
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+
+# Set OpenMP environment
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$(nproc)}
+export OMP_PLACES=${OMP_PLACES:-cores}
+export OMP_PROC_BIND=${OMP_PROC_BIND:-close}
+
+# Run GROMACS
+exec "$@"
+EOF
+    chmod +x /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_wrapper.sh
+    
+    # Wrap the gmx_mpi executable
+    mv /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_mpi /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_mpi.real
+    cat > /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_mpi << 'EOF'
+#!/bin/bash
+exec /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_wrapper.sh /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_mpi.real "$@"
+EOF
+    chmod +x /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_mpi
+    
+    # Create environment setup script
+    cat > /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/GMXRC << 'EOF'
+#!/bin/bash
+# Environment setup for GROMACS with AOCL 5.0
+
+# Set CUDA environment
+export PATH=/usr/local/cuda-11.6/bin:$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-11.6/lib64:$LD_LIBRARY_PATH
+
+# Set GROMACS environment
+export GMXPREFIX=/opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2
+. $GMXPREFIX/bin/GMXRC.bash
+
+# Add system library path
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+
+# Optimal runtime settings for AMD Genoa
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-$(nproc)}
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
+
+# AMD-specific optimizations
+export AMD_LOG_LEVEL=0
+export GOMP_CPU_AFFINITY="0-$((($(nproc) - 1)))"
+
+# Memory allocator settings
+export MALLOC_MMAP_THRESHOLD_=262144
+export MALLOC_TRIM_THRESHOLD_=4194304
+EOF
+    
+    chmod +x /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/GMXRC
+
+%environment
+    export PATH=/opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin:$PATH
+    . /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/GMXRC
+
+%runscript
+    exec "$@"
+
+%labels
+    Author "Your Name"
+    Version "1.0"
+    Description "GROMACS 2021.5 with CUDA 11.6.2 support on Ubuntu 22.04"
+    CUDA_Version "11.6.2"
+    GCC_Version "11"
+
+%help
+    This container provides GROMACS 2021.5 compiled with system libraries and CUDA support.
+    Uses system FFTW, OpenBLAS, and LAPACK libraries for simplicity and to avoid versioned OpenMP symbol issues.
+    
+    Build: apptainer build gromacs-system-libs.sif gromacs-system-libs.def
+    Run: apptainer exec gromacs-system-libs.sif gmx_mpi
