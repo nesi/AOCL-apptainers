@@ -16,8 +16,6 @@ From: ubuntu:22.04
         cmake \
         build-essential \
         libhwloc-dev \
-        libopenmpi-dev \
-        openmpi-bin \
         python3 \
         python3-pip \
         curl \
@@ -39,8 +37,17 @@ From: ubuntu:22.04
         libgfortran5 \
         libgomp1
     
+    # Install system FFTW libraries
+    apt-get install -y libfftw3-dev
+    
+    # Install system BLAS and LAPACK libraries
+    apt-get install -y libopenblas-dev liblapack-dev
+    
     # Create working directories
-    mkdir -p /opt/amd /opt/gromacs /opt/cuda
+    mkdir -p /opt/amd /opt/gromacs /opt/cuda /opt/ompi
+    
+    # Install SLURM PMI development files for MPI compatibility
+    apt-get install -y libslurm-dev libpmi2-0-dev
     
     # Install AMD AOCL 5.0
     cd /opt/amd
@@ -53,50 +60,26 @@ From: ubuntu:22.04
         exit 1
     fi
     
-    # Find actual AOCL installation
-    AOCL_ROOT="/opt/AMD/aocl/aocl-linux-aocc-5.0.0"
+    # Build OpenMPI with SLURM PMI support
+    cd /opt/ompi
+    wget https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-4.1.5.tar.gz
+    tar -xzf openmpi-4.1.5.tar.gz
+    cd openmpi-4.1.5
     
-    # Install system FFTW libraries
-    apt-get install -y libfftw3-dev
+    # Configure OpenMPI with SLURM PMI support
+    ./configure --prefix=/opt/ompi/install \
+        --with-slurm \
+        --with-pmi=/usr \
+        --with-pmi-libdir=/usr/lib/x86_64-linux-gnu \
+        CC=gcc-11 CXX=g++-11 FC=gfortran-11
     
-    # Install system BLAS and LAPACK libraries
-    apt-get install -y libopenblas-dev liblapack-dev
+    # Build and install OpenMPI
+    make -j$(nproc)
+    make install
     
-    # Create directory structure for our modified libraries
-    mkdir -p /opt/amd/aocl-systemlibs/lib
-    mkdir -p /opt/amd/aocl-systemlibs/lib_LP64
-    mkdir -p /opt/amd/aocl-systemlibs/include
-    
-    # Copy include files
-    if [ -d "$AOCL_ROOT/aocc/include_LP64" ]; then
-        cp -r "$AOCL_ROOT/aocc/include_LP64"/* /opt/amd/aocl-systemlibs/include/
-    fi
-    
-    # Function to patch libraries - Replace OpenMP with system gomp
-    copy_and_patch_lib() {
-        local src_file="$1"
-        local dst_file="$2"
-        
-        echo "Processing $src_file..."
-        
-        # Copy the file
-        cp -L "$src_file" "$dst_file"
-        
-        # Replace AMD OpenMP with system gomp
-        patchelf --replace-needed libomp.so "libgomp.so.1" "$dst_file" 2>/dev/null || true
-        patchelf --replace-needed libomp.so.5 "libgomp.so.1" "$dst_file" 2>/dev/null || true
-        
-        # Add proper rpath
-        patchelf --force-rpath --set-rpath '/opt/amd/aocl-systemlibs/lib:/opt/amd/aocl-systemlibs/lib_LP64:/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu' "$dst_file" 2>/dev/null || true
-        
-        echo "  Patched: $dst_file"
-    }
-    
-    # Skip problematic AOCL copy operations
-    echo "Skipping AOCL library processing - using system libraries instead"
-    
-    # Skip AMD FFTW libraries, we'll use system libraries instead
-    echo "Using system FFTW libraries instead of AOCL versions"
+    # Add OpenMPI to PATH and LD_LIBRARY_PATH
+    export PATH=/opt/ompi/install/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/ompi/install/lib:$LD_LIBRARY_PATH
     
     # Install CUDA 11.6.2
     cd /opt/cuda
@@ -135,10 +118,10 @@ From: ubuntu:22.04
     FFTW_INC="/usr/include"
     
     # Set environment for build
-    export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
-    export LDFLAGS="-L/usr/lib/x86_64-linux-gnu -lfftw3 -lfftw3f -lopenblas -llapack"
+    export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/opt/ompi/install/lib:$LD_LIBRARY_PATH"
+    export LDFLAGS="-L/usr/lib/x86_64-linux-gnu -L/opt/ompi/install/lib -lfftw3 -lfftw3f -lopenblas -llapack"
     
-    # Configure with system libraries
+    # Configure with system libraries and SLURM-aware OpenMPI
     cmake .. \
         -DCMAKE_INSTALL_PREFIX=/opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2 \
         -DCMAKE_BUILD_TYPE=Release \
@@ -148,6 +131,8 @@ From: ubuntu:22.04
         -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-11.6 \
         -DGMX_CUDA_TARGET_SM="80" \
         -DGMX_MPI=ON \
+        -DMPI_C_COMPILER=/opt/ompi/install/bin/mpicc \
+        -DMPI_CXX_COMPILER=/opt/ompi/install/bin/mpicxx \
         -DCMAKE_C_COMPILER=gcc-11 \
         -DCMAKE_CXX_COMPILER=g++-11 \
         -DCMAKE_Fortran_COMPILER=gfortran-11 \
@@ -168,8 +153,8 @@ From: ubuntu:22.04
         -DOpenMP_gomp_LIBRARY="/usr/lib/x86_64-linux-gnu/libgomp.so.1" \
         -DOpenMP_C_FLAGS="-fopenmp" \
         -DOpenMP_C_LIB_NAMES="gomp" \
-        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath=/usr/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lfftw3 -lfftw3f -lopenblas -llapack -lgfortran" \
-        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath=/usr/lib/x86_64-linux-gnu -L/usr/lib/x86_64-linux-gnu -lfftw3 -lfftw3f -lopenblas -llapack -lgfortran"
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath=/usr/lib/x86_64-linux-gnu:/opt/ompi/install/lib -L/usr/lib/x86_64-linux-gnu -L/opt/ompi/install/lib -lfftw3 -lfftw3f -lopenblas -llapack -lgfortran" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath=/usr/lib/x86_64-linux-gnu:/opt/ompi/install/lib -L/usr/lib/x86_64-linux-gnu -L/opt/ompi/install/lib -lfftw3 -lfftw3f -lopenblas -llapack -lgfortran"
     
     # Build GROMACS
     make -j$(nproc)
@@ -181,7 +166,7 @@ From: ubuntu:22.04
     cat > /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/gmx_wrapper.sh << 'EOF'
 #!/bin/bash
 # Ensure our custom libraries are found
-export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/opt/ompi/install/lib:$LD_LIBRARY_PATH"
 
 # Set OpenMP environment
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-$(nproc)}
@@ -204,11 +189,15 @@ EOF
     # Create environment setup script
     cat > /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/GMXRC << 'EOF'
 #!/bin/bash
-# Environment setup for GROMACS with AOCL 5.0
+# Environment setup for GROMACS with CUDA and SLURM support
 
 # Set CUDA environment
 export PATH=/usr/local/cuda-11.6/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/cuda-11.6/lib64:$LD_LIBRARY_PATH
+
+# Set OpenMPI environment
+export PATH=/opt/ompi/install/bin:$PATH
+export LD_LIBRARY_PATH=/opt/ompi/install/lib:$LD_LIBRARY_PATH
 
 # Set GROMACS environment
 export GMXPREFIX=/opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2
@@ -232,10 +221,34 @@ export MALLOC_TRIM_THRESHOLD_=4194304
 EOF
     
     chmod +x /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/GMXRC
+    
+    # Create special mpirun script that respects SLURM environment
+    cat > /opt/gromacs/mpirun-slurm.sh << 'EOF'
+#!/bin/bash
+# This script handles running MPI applications within SLURM properly
+
+# Check if running under SLURM
+if [ -n "$SLURM_JOB_ID" ]; then
+    # Use srun to launch MPI processes
+    srun --mpi=pmi2 "$@"
+else
+    # Not in SLURM, use regular mpirun
+    /opt/ompi/install/bin/mpirun "$@"
+fi
+EOF
+    chmod +x /opt/gromacs/mpirun-slurm.sh
 
 %environment
+    # Add OpenMPI to path
+    export PATH=/opt/ompi/install/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/ompi/install/lib:$LD_LIBRARY_PATH
+    
+    # Add GROMACS to path
     export PATH=/opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin:$PATH
     . /opt/gromacs/2021.5-aocl-5.0-cuda-11.6.2/bin/GMXRC
+    
+    # Add mpirun-slurm wrapper to path
+    export PATH=/opt/gromacs:$PATH
 
 %runscript
     exec "$@"
@@ -243,13 +256,22 @@ EOF
 %labels
     Author "Your Name"
     Version "1.0"
-    Description "GROMACS 2021.5 with CUDA 11.6.2 support on Ubuntu 22.04"
+    Description "GROMACS 2021.5 with CUDA 11.6.2 and SLURM PMI support on Ubuntu 22.04"
     CUDA_Version "11.6.2"
     GCC_Version "11"
+    OpenMPI_Version "4.1.5"
 
 %help
-    This container provides GROMACS 2021.5 compiled with system libraries and CUDA support.
-    Uses system FFTW, OpenBLAS, and LAPACK libraries for simplicity and to avoid versioned OpenMP symbol issues.
+    This container provides GROMACS 2021.5 compiled with system libraries, CUDA support,
+    and proper SLURM PMI integration for running on clusters.
     
-    Build: apptainer build gromacs-system-libs.sif gromacs-system-libs.def
-    Run: apptainer exec gromacs-system-libs.sif gmx_mpi
+    Build: apptainer build gromacs-slurm.sif gromacs-slurm.def
+    
+    To run directly within SLURM:
+    srun --mpi=pmi2 apptainer exec gromacs-slurm.sif gmx_mpi [options]
+    
+    or use the wrapper script:
+    apptainer exec gromacs-slurm.sif mpirun-slurm.sh gmx_mpi [options]
+    
+    Remember that when using the container with SLURM, you should let SLURM handle
+    the process placement and MPI initialization, rather than using mpirun directly.
